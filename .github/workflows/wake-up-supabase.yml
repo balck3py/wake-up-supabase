@@ -18,7 +18,7 @@ jobs:
             exit 1
           fi
 
-      - name: Ping Supabase projects to keep them awake
+      - name: Ping Supabase databases to keep them awake
         env:
           SUPABASE_PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
         run: |
@@ -37,6 +37,7 @@ jobs:
           for i in $(seq 0 $((LENGTH - 1))); do
             URL=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].url")
             KEY=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].anon_key")
+            TABLE=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].table")
 
             if [ -z "$URL" ] || [ "$URL" = "null" ]; then
               echo "⚠️ Skipping project at index $i — missing url."
@@ -48,15 +49,25 @@ jobs:
               continue
             fi
 
-            # Auth health endpoint – always exists and is safe to call with anon key
-            HEALTH_URL="${URL%/}/auth/v1/health"
-            echo "🌐 Pinging AUTH via: $HEALTH_URL"
+            if [ -z "$TABLE" ] || [ "$TABLE" = "null" ]; then
+              echo "⚠️ Skipping $URL — missing table."
+              echo "   Add a \"table\" field pointing at a real table that the"
+              echo "   anon role can SELECT (RLS must allow it)."
+              continue
+            fi
+
+            # Hit the PostgREST data API. Unlike /auth/v1/health, a query to
+            # /rest/v1/<table> actually executes against Postgres, which is
+            # what resets Supabase's 7-day inactivity timer.
+            QUERY_URL="${URL%/}/rest/v1/${TABLE}?select=*&limit=1"
+            echo "🌐 Querying DATABASE via: ${URL%/}/rest/v1/${TABLE}"
 
             # Allow curl to fail without killing the whole job
             set +e
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "apikey: $KEY" \
-              "$HEALTH_URL")
+              -H "Authorization: Bearer $KEY" \
+              "$QUERY_URL")
             CURL_EXIT=$?
             set -e
 
@@ -66,8 +77,12 @@ jobs:
             fi
 
             if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "✅ $URL responded with HTTP $HTTP_CODE — project is reachable."
+              echo "✅ $URL responded with HTTP $HTTP_CODE — database query succeeded, timer reset."
+            elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+              echo "⚠️ $URL responded with HTTP $HTTP_CODE — check the anon key and RLS policy on \"$TABLE\"."
+            elif [ "$HTTP_CODE" = "404" ]; then
+              echo "❌ $URL responded with HTTP $HTTP_CODE — table \"$TABLE\" not found via the API."
             else
-              echo "❌ $URL responded with HTTP $HTTP_CODE — check project status or URL."
+              echo "❌ $URL responded with HTTP $HTTP_CODE — check project status, URL, or table."
             fi
           done

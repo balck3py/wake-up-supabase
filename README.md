@@ -5,9 +5,11 @@ A tiny GitHub Actions helper that prevents free Supabase projects from being aut
 Supabase pauses inactive free-tier projects after about a week.  
 If a project stays paused for 90 days, it is permanently deleted.
 
-This workflow performs a lightweight daily ping to each project’s  
-`/auth/v1/health` endpoint using anon keys (safe to use, public by design).  
-This activity prevents auto-pausing and keeps your projects alive.
+Supabase's 7-day inactivity timer is tracked against **database activity** —
+not API requests, dashboard visits, or auth health checks. So this workflow
+performs a lightweight daily query against a real table in each project via
+the PostgREST data API (`/rest/v1/<table>`). That query actually hits Postgres,
+which resets the timer and keeps your projects alive.
 
 ---
 
@@ -52,11 +54,13 @@ Paste your projects in this format:
     [
       {
         "url": "https://your-project-1.supabase.co",
-        "anon_key": "YOUR_PROJECT_1_ANON_PUBLIC_KEY"
+        "anon_key": "YOUR_PROJECT_1_ANON_PUBLIC_KEY",
+        "table": "your_table_1"
       },
       {
         "url": "https://your-project-2.supabase.co",
-        "anon_key": "YOUR_PROJECT_2_ANON_PUBLIC_KEY"
+        "anon_key": "YOUR_PROJECT_2_ANON_PUBLIC_KEY",
+        "table": "your_table_2"
       }
     ]
 
@@ -64,6 +68,18 @@ Add as many projects as you want.
 
 💡 Only use anon keys — never the service_role key.  
 You can find anon keys under: Supabase Dashboard → Project Settings → API
+
+### `table` — important
+
+The `table` value must be a **real table that the `anon` role can `SELECT`**.
+The workflow runs `SELECT * ... LIMIT 1` against it, and that query is what
+actually keeps the project awake.
+
+- The table must exist and be exposed via the API.
+- Its Row Level Security (RLS) policy must allow the `anon` role to read it,
+  otherwise the request returns `401`/`403`.
+- If you don't already have a suitable table, create a tiny one (e.g.
+  `keep_alive`) with one row and an RLS policy granting `SELECT` to `anon`.
 
 ---
 
@@ -85,30 +101,44 @@ This action runs every day at 06:00 UTC.
 
 For each project in your SUPABASE_PROJECTS_JSON secret, it:
 
-1. Calls  
-   https://your-project.supabase.co/auth/v1/health
+1. Builds the data-API URL  
+   `https://your-project.supabase.co/rest/v1/<table>?select=*&limit=1`
 
-2. Sends the anon key in an `apikey` header  
-3. Checks whether the project responded correctly  
+2. Sends the anon key in both the `apikey` and `Authorization: Bearer` headers  
+3. Runs that `SELECT ... LIMIT 1` query and checks the HTTP status  
 
-Supabase counts this as legitimate activity and will not pause the project.
+That query runs against Postgres, which is the activity Supabase tracks — so
+the inactivity timer is reset and the project is not paused.
+
+A failing project never aborts the run: a missing field, a curl error, or a
+non-2xx status is logged and the loop moves on to the next project.
+
+> ⚠️ This workflow **prevents** pausing — it cannot wake an already-paused
+> project. If a project is already paused, restore it once from the Supabase
+> dashboard; the daily query then keeps it awake from there on.
 
 ---
 
 ## 🧪 Example Log Output
 
-    Found 3 projects.
-    Pinging https://abc123.supabase.co/auth/v1/health ...
-    ✔ abc123.supabase.co is awake (HTTP 200)
-    Pinging https://def456.supabase.co/auth/v1/health ...
-    ✔ def456.supabase.co is awake (HTTP 200)
+    📦 Found 2 Supabase project(s).
+    🌐 Querying DATABASE via: https://abc123.supabase.co/rest/v1/keep_alive
+    ✅ https://abc123.supabase.co responded with HTTP 200 — database query succeeded, timer reset.
+    🌐 Querying DATABASE via: https://def456.supabase.co/rest/v1/keep_alive
+    ✅ https://def456.supabase.co responded with HTTP 200 — database query succeeded, timer reset.
 
 ---
 
 ## ❓ FAQ
 
+**Why query a table instead of pinging `/auth/v1/health`?**  
+Supabase's inactivity timer only counts **database activity**. The auth health
+endpoint never touches Postgres, so pinging it does not reset the timer and the
+project still gets paused. A `SELECT` on a real table is an actual database
+query, so it does.
+
 **Does this work for multiple Supabase accounts?**  
-Yes — simply add all your project URLs and anon keys to the secret.
+Yes — simply add all your projects (url, anon_key, table) to the secret.
 
 **Can this repo be public?**  
 Yes — all sensitive data stays inside GitHub Secrets.
