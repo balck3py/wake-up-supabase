@@ -1,5 +1,7 @@
 # Wake Up Supabase
 
+**English** | [简体中文](./README.zh-CN.md)
+
 A tiny GitHub Actions helper that prevents free Supabase projects from being automatically paused due to inactivity.
 
 Supabase pauses inactive free-tier projects after about a week.  
