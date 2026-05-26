@@ -9,8 +9,11 @@ Supabase 会在大约一周不活跃后暂停免费版项目。
 
 Supabase 的 7 天不活跃计时器只统计**数据库活动** —— 而非 API 请求、
 访问 dashboard 或认证健康检查。因此本 workflow 每天通过 PostgREST 数据接口
-（`/rest/v1/<table>`）对每个项目里的一张真实表执行一次轻量查询。这条查询会
-真正命中 Postgres，从而重置计时器，让你的项目保持活跃。
+（`POST /rest/v1/wake_up_supabase`）向每个项目里的一张专用表**写入一行**。
+`INSERT` 是一次无歧义的数据库事务 —— 不会被任何缓存代答，正是计时器统计的那种活动。
+
+> 之前这个 workflow 用的是每天一次 `SELECT`。实测发现某些项目仅靠读取并不能
+> 稳定重置计时器，因此改为 `INSERT`。一天一行毫无负担 —— 每个项目一年约 365 行。
 
 ---
 
@@ -40,7 +43,32 @@ Supabase 的 7 天不活跃计时器只统计**数据库活动** —— 而非 A
 
 ---
 
-### 2. 把你的 Supabase 项目添加到 GitHub Secret
+### 2. 在每个 Supabase 项目里建好心跳表
+
+对你要保活的**每一个** Supabase 项目，打开
+**Supabase Dashboard → SQL Editor**，把下面这段 SQL 跑一次：
+
+```sql
+create table if not exists public.wake_up_supabase (
+  id bigserial primary key,
+  value text not null
+);
+
+alter table public.wake_up_supabase enable row level security;
+
+create policy "anon insert wake_up_supabase"
+  on public.wake_up_supabase
+  for insert
+  to anon
+  with check (true);
+```
+
+这段 SQL 会创建一张很小的表，并授予 `anon` 角色写入权限。**没有**授予 `select`
+策略，因此 anon 无法读回这些行 —— 这张表对公开 API 来说是只写的。
+
+---
+
+### 3. 把你的 Supabase 项目添加到 GitHub Secret
 
 进入：
 
@@ -55,13 +83,11 @@ Settings → Secrets and variables → Actions → New repository secret
     [
       {
         "url": "https://your-project-1.supabase.co",
-        "anon_key": "YOUR_PROJECT_1_ANON_PUBLIC_KEY",
-        "table": "your_table_1"
+        "anon_key": "YOUR_PROJECT_1_ANON_PUBLIC_KEY"
       },
       {
         "url": "https://your-project-2.supabase.co",
-        "anon_key": "YOUR_PROJECT_2_ANON_PUBLIC_KEY",
-        "table": "your_table_2"
+        "anon_key": "YOUR_PROJECT_2_ANON_PUBLIC_KEY"
       }
     ]
 
@@ -70,25 +96,33 @@ Settings → Secrets and variables → Actions → New repository secret
 💡 只使用 anon key —— 绝不要用 service_role key。
 anon key 可在以下位置找到：Supabase Dashboard → Project Settings → API
 
-### `table` —— 重要
+#### `table` —— 可选
 
-`table` 的值必须是一张 **`anon` 角色能够 `SELECT` 的真实表**。
-workflow 会对它执行 `SELECT * ... LIMIT 1`，正是这条查询让项目保持活跃。
+如果不填 `table`，workflow 会写入 `wake_up_supabase`（即步骤 2 里建的表）。
+只有当你想指向自定义表时才需要填 `table`：
 
-- 该表必须存在，并已通过 API 暴露。
-- 它的行级安全策略（RLS）必须允许 `anon` 角色读取，否则请求会返回 `401`/`403`。
-- 如果你没有合适的表，可以新建一张很小的表（例如 `keep_alive`），放入一行数据，
-  并配置一条允许 `anon` 进行 `SELECT` 的 RLS 策略。
+    {
+      "url": "https://your-project.supabase.co",
+      "anon_key": "YOUR_PROJECT_ANON_PUBLIC_KEY",
+      "table": "your_custom_table"
+    }
+
+自定义表必须满足：
+
+- 已存在并通过 API 暴露，
+- 有一条允许 `anon` 角色 `INSERT` 的 RLS 策略，
+- 能接收 JSON body `{"value": "<iso-timestamp>"}`（即有一个 `value text` 列，
+  或者能容纳字符串的列）。
 
 ---
 
-### 3. 启用 GitHub Actions
+### 4. 启用 GitHub Actions
 
 进入 Actions 标签页 → 如有需要，启用 workflows。
 
 ---
 
-### 4.（可选）手动运行一次
+### 5.（可选）手动运行一次
 
 Actions 标签页 → 选择该 workflow → Run workflow。
 
@@ -101,42 +135,52 @@ Actions 标签页 → 选择该 workflow → Run workflow。
 对于 SUPABASE_PROJECTS_JSON secret 中的每个项目，它会：
 
 1. 构造数据接口 URL
-   `https://your-project.supabase.co/rest/v1/<table>?select=*&limit=1`
+   `https://your-project.supabase.co/rest/v1/wake_up_supabase`
 
 2. 在 `apikey` 和 `Authorization: Bearer` 两个请求头中携带 anon key
-3. 执行该 `SELECT ... LIMIT 1` 查询并检查 HTTP 状态码
+3. `POST` 一段 JSON `{"value": "<当前 UTC 时间>"}`，并校验返回 HTTP 201
 
-这条查询会真正命中 Postgres —— 而这正是 Supabase 所统计的活动，因此
-不活跃计时器会被重置，项目不会被暂停。
+这条 `INSERT` 会真正在 Postgres 上执行 —— 而这正是 Supabase 所统计的活动，
+因此不活跃计时器会被重置，项目不会被暂停。
 
 某个项目失败不会中断整次运行：缺字段、curl 出错或返回非 2xx 状态都会被记录，
 随后循环继续处理下一个项目。
 
 > ⚠️ 本 workflow 用于**预防**暂停 —— 它无法唤醒一个已被暂停的项目。
 > 如果项目已经被暂停，请先在 Supabase dashboard 中手动 Restore 恢复一次，
-> 之后每天的查询就能持续让它保持活跃。
+> 之后每天的写入就能持续让它保持活跃。
 
 ---
 
 ## 🧪 日志输出示例
 
     📦 Found 2 Supabase project(s).
-    🌐 Querying DATABASE via: https://abc123.supabase.co/rest/v1/keep_alive
-    ✅ https://abc123.supabase.co responded with HTTP 200 — database query succeeded, timer reset.
-    🌐 Querying DATABASE via: https://def456.supabase.co/rest/v1/keep_alive
-    ✅ https://def456.supabase.co responded with HTTP 200 — database query succeeded, timer reset.
+    🕒 Heartbeat value: 2026-05-26T06:00:00Z
+    🌐 Inserting heartbeat into: https://abc123.supabase.co/rest/v1/wake_up_supabase
+    ✅ https://abc123.supabase.co responded with HTTP 201 — row inserted, timer reset.
+    🌐 Inserting heartbeat into: https://def456.supabase.co/rest/v1/wake_up_supabase
+    ✅ https://def456.supabase.co responded with HTTP 201 — row inserted, timer reset.
 
 ---
 
 ## ❓ 常见问题
 
-**为什么是查询一张表，而不是 ping `/auth/v1/health`？**
+**为什么是写一行，而不是 `SELECT`？**
+Supabase 的不活跃计时器只统计**数据库活动**。`SELECT` 可能被缓存代答，或被
+RLS 拒绝（401/403 并不算活动）。实测发现仅靠每天 `SELECT` 部分项目仍然会被
+暂停。`INSERT` 是一次无歧义的写事务 —— Postgres 必须真实执行，Supabase 会
+明确地把它算作活动。
+
+**表会不会一直变大？**
+一天一行 = 每个项目每年约 365 行，多年下来也完全无负担。要清理的话，随时在
+SQL Editor 里跑 `truncate public.wake_up_supabase` 即可。
+
+**为什么要查表，而不是 ping `/auth/v1/health`？**
 Supabase 的不活跃计时器只统计**数据库活动**。认证健康检查接口完全不会触及
-Postgres，所以 ping 它并不会重置计时器，项目依然会被暂停。对一张真实表执行
-`SELECT` 才是一次真正的数据库查询，因此能起作用。
+Postgres，所以 ping 它不会重置计时器。
 
 **这能用于多个 Supabase 账号吗？**
-可以 —— 只需把你所有项目（url、anon_key、table）都加入 secret 即可。
+可以 —— 只需把你所有项目都加入 secret 即可。
 
 **这个仓库可以公开吗？**
 可以 —— 所有敏感数据都保存在 GitHub Secrets 中。

@@ -18,7 +18,7 @@ jobs:
             exit 1
           fi
 
-      - name: Ping Supabase databases to keep them awake
+      - name: Insert a heartbeat row into each Supabase project
         env:
           SUPABASE_PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
         run: |
@@ -33,6 +33,9 @@ jobs:
             echo "⚠️ No projects defined in SUPABASE_PROJECTS_JSON."
             exit 0
           fi
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "🕒 Heartbeat value: $NOW"
 
           for i in $(seq 0 $((LENGTH - 1))); do
             URL=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].url")
@@ -49,25 +52,28 @@ jobs:
               continue
             fi
 
+            # table is optional; default to wake_up_supabase
             if [ -z "$TABLE" ] || [ "$TABLE" = "null" ]; then
-              echo "⚠️ Skipping $URL — missing table."
-              echo "   Add a \"table\" field pointing at a real table that the"
-              echo "   anon role can SELECT (RLS must allow it)."
-              continue
+              TABLE="wake_up_supabase"
             fi
 
-            # Hit the PostgREST data API. Unlike /auth/v1/health, a query to
-            # /rest/v1/<table> actually executes against Postgres, which is
-            # what resets Supabase's 7-day inactivity timer.
-            QUERY_URL="${URL%/}/rest/v1/${TABLE}?select=*&limit=1"
-            echo "🌐 Querying DATABASE via: ${URL%/}/rest/v1/${TABLE}"
+            # POST a row to the PostgREST data API. An INSERT is an unambiguous
+            # DB write — it bypasses any read cache and is exactly the kind of
+            # activity Supabase's 7-day inactivity timer tracks.
+            INSERT_URL="${URL%/}/rest/v1/${TABLE}"
+            BODY=$(jq -n --arg v "$NOW" '{value: $v}')
+            echo "🌐 Inserting heartbeat into: ${URL%/}/rest/v1/${TABLE}"
 
             # Allow curl to fail without killing the whole job
             set +e
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
               -H "apikey: $KEY" \
               -H "Authorization: Bearer $KEY" \
-              "$QUERY_URL")
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=minimal" \
+              --data "$BODY" \
+              "$INSERT_URL")
             CURL_EXIT=$?
             set -e
 
@@ -76,12 +82,14 @@ jobs:
               continue
             fi
 
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "✅ $URL responded with HTTP $HTTP_CODE — database query succeeded, timer reset."
+            if [ "$HTTP_CODE" = "201" ]; then
+              echo "✅ $URL responded with HTTP 201 — row inserted, timer reset."
             elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
-              echo "⚠️ $URL responded with HTTP $HTTP_CODE — check the anon key and RLS policy on \"$TABLE\"."
+              echo "⚠️ $URL responded with HTTP $HTTP_CODE — anon role can't insert into \"$TABLE\"."
+              echo "   Run the setup SQL from the README in the Supabase SQL Editor to create the table and RLS policy."
             elif [ "$HTTP_CODE" = "404" ]; then
-              echo "❌ $URL responded with HTTP $HTTP_CODE — table \"$TABLE\" not found via the API."
+              echo "❌ $URL responded with HTTP $HTTP_CODE — table \"$TABLE\" not found."
+              echo "   Run the setup SQL from the README, or check the table name."
             else
               echo "❌ $URL responded with HTTP $HTTP_CODE — check project status, URL, or table."
             fi
